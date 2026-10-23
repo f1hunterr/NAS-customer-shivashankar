@@ -5,6 +5,19 @@ Customer: Shivashankar (login: Shinju_synology)
 Device: Synology DS224+ (synology_geminilake_224+), DSM 7.4.1-90080
 NAS hostname: Shinju
 LAN IP: 192.168.50.96
+SSH: port 2022 (not default 22 — both enabled per DSM Service list, 2022 used throughout)
+DSM users: `admin` (default, was Deactivated, reactivated during this session — password set
+to match Shinju_synology's), `guest` (Deactivated), `Shinju_synology` (Normal, administrators
+group member)
+
+## Other device on same network (same customer)
+**CasaOS NAS** — host `casaosnas`, LAN IP 192.168.50.83, Ubuntu 22.04-based (kernel
+5.15.0-198-generic), login `shrijay`. Separate box from the Synology, not part of the
+WireGuard VPN build — checked only for health (disk/mem OK, CasaOS v0.4.15 up to date,
+no upgrade pending). Not AD-joined, no sudo issues encountered there (not deeply tested).
+Storage: /DATA pool 3.8TB (1.3TB used), additional mounts Storage1 (1.8TB), Storage2_New
+(931GB) — note Storage2_New had a mount-naming collision for a second 931GB disk showing
+as `/mnt/Storage2_New-/dev/sdd1` (unexplored/not fixed — flagged only).
 
 ## Network Topology
 ```
@@ -34,6 +47,21 @@ Public IP (at setup time): 117.221.142.224
    - WG_MTU: 1280 (reduced from default 1420 to fix PPPoE + double-NAT fragmentation issue)
    - Config volume: `/volume1/docker/wg-easy` (persists across container recreates)
    - Ports: 51820/udp (WireGuard), 51821/tcp (web UI)
+   - Docker run command used (password hash redacted, regenerate via `docker run --rm
+     ghcr.io/wg-easy/wg-easy wgpw '<password>'` if rebuilding):
+     ```
+     docker run -d --name=wg-easy \
+       -e WG_HOST=117.221.142.224 \
+       -e WG_MTU=1280 \
+       -e PASSWORD_HASH='<bcrypt hash — see dashboard password>' \
+       -v /volume1/docker/wg-easy:/etc/wireguard \
+       -p 51821:51821/tcp -p 51820:51820/udp \
+       --cap-add=NET_ADMIN --cap-add=SYS_MODULE \
+       --sysctl="net.ipv4.conf.all.src_valid_mark=1" \
+       --sysctl="net.ipv4.ip_forward=1" \
+       --restart unless-stopped \
+       ghcr.io/wg-easy/wg-easy
+     ```
 
 ### Also installed (earlier attempt, superseded by Docker approach)
 - `WireGuard-geminilake` community .spk package (Andreas Runfalk build, DSM7.2) — CLI-only, no web UI.
@@ -42,9 +70,30 @@ Public IP (at setup time): 117.221.142.224
   **Consider removing the manual wg0 CLI setup to avoid confusion/port conflicts** if wg-easy
   is the long-term solution (uses same UDP 51820 — only one can bind it at a time; wg-easy
   currently wins since manual wg0 was brought down before starting the container).
+  - Config: `/etc/wireguard/wg0.conf`, server keys at `/etc/wireguard/server_private.key` /
+    `server_public.key`. Server pubkey from this build:
+    `SKj2eLR/k/+OEO2/vj+Db0RP4QRgzPnAss2z4RT2FH8=` (tunnel subnet 10.8.0.1/24, port 51820)
+  - One test peer was added manually (pubkey `khLiDkAIiaCeW5te6pH0sok1JpTva1+nDAsyhOScHF4=`,
+    later removed) and a second working client config generated (client pubkey derived from
+    private key `2NG1aCnR0UNkkH861bwgwVn07dwAG1EvFrFFcc8byG4=`, address 10.8.0.2/24) — this
+    client config was for testing only, written to `/tmp/client1.conf` on the NAS (ephemeral,
+    gone after reboot/tmp clear).
+  - **DSM Task Scheduler jobs created during setup/troubleshooting** (Control Panel → Task
+    Scheduler), all User: root, safe to delete once the manual wg0 path is decommissioned:
+    - `WG Start` — runs `/var/packages/WireGuard/scripts/start`
+    - `WG Setup` — generated server keys, brought up wg0 interface
+    - `WG Fix Sudo` / `WG Fix Sudo2` — the sudo/PAM fixes (see below)
+    - `WG Fix Pass` / `WG Fix Pass2` / `WG Fix Pass3` — password-sync attempts (Pass/Pass2 used
+      `chpasswd`, not present on this BusyBox-based DSM — failed harmlessly; Pass3 used the
+      correct `synouser --setpw` and succeeded)
+  - Pre-existing task `TUN` (owner root, runs at Boot-up, user-defined script) was already on
+    this NAS before this session — not created by us, likely enables the TUN kernel module for
+    some other VPN-related purpose. Left untouched.
 - WGDashboard (Python/Flask) — attempted, **failed**: this NAS's Python is 3.8.15, WGDashboard's
   current codebase requires Python 3.10+ (uses `X | None` type hint syntax). Not viable without
   a newer Python interpreter. Abandoned in favor of wg-easy (Docker-based, sidesteps Python version).
+  Leftover artifacts if anyone goes looking: `/usr/local/wgdashboard/` (venv + source, unused),
+  pip was bootstrapped via `python3 -m ensurepip` (pip 22.0.4) since no `pip3` existed originally.
 
 ## Critical Issue Found & Fixed: sudo/PAM broken
 **Root cause**: `/etc/pam.d/sudo` had `pam_syno_support.so` (tied to Synology's remote
@@ -85,6 +134,25 @@ Backup of original file saved to `/etc/pam.d/sudo.bak` on the NAS.
 Also ran `synouser --setpw Shinju_synology 'Shriju@2022'` to resync the local Unix password
 hash (SSH login uses DSM's own auth backend, not necessarily synced to the local shadow file
 used by sudo/pam_unix — this was contributing to the mismatch).
+
+Note: `root`'s local Unix password was also set to the same value during troubleshooting
+(`synouser --setpw root '...'` attempt, and later a `chpasswd` attempt that failed — command
+not found on BusyBox). Root's shadow password MAY now be set, but **root SSH login is still
+refused** — confirmed this is blocked at the sshd config level (`PermitRootLogin no`), not a
+password issue, so this is not an actual access path and was not pursued further.
+
+## Speed / Capacity Testing
+- WAN speed test via Cloudflare endpoints (curl from the NAS itself): download ~179 Mbps
+  (22.3 MB/s), upload ~134 Mbps (16.7 MB/s)
+- UDP port check (external, via SkyPath tool) for 51820 came back "No reply (open or
+  filtered)" — **this is EXPECTED and inconclusive for WireGuard**, which by design never
+  responds to non-handshake packets (anti-scanning behavior). Generic UDP probes cannot
+  confirm WireGuard reachability; only a real client handshake attempt can. Traffic counters
+  on the iptables FORWARD/POSTROUTING chains (3383+ packets, several MB) later confirmed real
+  traffic was flowing once a client connected, validating port forwarding works end-to-end.
+- Realistic transfer capacity estimate: ~15-17 MB/s pulling files from NAS remotely (capped by
+  WAN upload), ~18-20 MB/s pushing files to NAS remotely (capped by WAN download). CPU
+  (Celeron J4125, ChaCha20 ~300-450 Mbps capacity) is not the bottleneck — the WAN link is.
 
 ## Port Forwarding Rules
 ### ISP ONT (Syrotech, 192.168.1.1, admin/Syro@432103)
